@@ -1,9 +1,9 @@
-def generate_channel_mapping(start_number: int, num_channels: int) -> str:
+def generate_channel_mapping(sensor_start_number: int, num_channels: int) -> str:
     mappings = []
     for i in range(num_channels):
-        sensor_number = start_number + i
         channel_number = i + 1
-        mappings.append(f"{sensor_number}:{channel_number}")
+        sensor_number = sensor_start_number + i
+        mappings.append(f"{channel_number}:{sensor_number}")
 
     return ", ".join(mappings)
 

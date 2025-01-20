@@ -45,7 +45,7 @@ def start_live_upload(upload_type):
     # Assumes same number of measurements across all channels
     num_data_points = len(datastream_data_dict[next(iter(datastream_data_dict))][0])
     # In seconds
-    upload_interval = 0.2
+    upload_interval = 0.1
     # Actual spacing between data points
     data_point_interval = upload_interval / 2
     # January 22, 2022 at 15:30:00 UTC
