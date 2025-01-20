@@ -1,3 +1,5 @@
+# Not really part of the uploader but a useful utility function that can be expanded on
+
 def generate_channel_mapping(sensor_start_number: int, num_channels: int) -> str:
     mappings = []
     for i in range(num_channels):

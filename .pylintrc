@@ -1,0 +1,6 @@
+[MASTER]
+extension-pkg-allow-list=PyQt6
+disable=C0111,R0913
+
+[MESSAGES CONTROL]
+disable=C0111,no-name-in-module,c-extension-no-member

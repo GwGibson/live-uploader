@@ -15,6 +15,8 @@ class LiveUploader:
         self.timestamps_set = False
         self.database_details_set = False
         self.database_cleared = False
+        self._pause_requested = False
+        self._resume_requested = False
 
         self.logger = None
         self.timestamps = None
@@ -24,9 +26,17 @@ class LiveUploader:
         self.host = None
         self.port = None
 
+    def pause_upload(self):
+        self._pause_requested = True
+        self._resume_requested = False
+
+    def resume_upload(self):
+        self._resume_requested = True
+        self._pause_requested = False
+
     def upload(
         self,
-        datastream_data_dict,
+        datastream,
         upload_interval,
     ):
         if not self.timestamps_set:
@@ -48,16 +58,12 @@ class LiveUploader:
         client = self.influxdb_client(self.host, self.port)
         client.switch_database(self.database_name)
 
-        datastreams = list(datastream_data_dict.keys())
-        data_arrays = list(datastream_data_dict.values())
-
         points_per_upload = int(upload_interval / data_point_interval)
-        processed_data = self._preprocess_data(data_arrays, points_per_upload)
+        processed_data = self._preprocess_data(datastream.data, points_per_upload)
 
         self._perform_live_upload(
             client,
             processed_data,
-            datastreams,
             points_per_upload,
             upload_interval,
         )
@@ -66,18 +72,23 @@ class LiveUploader:
         self,
         client,
         processed_data,
-        datastreams,
         points_per_upload,
         upload_interval,
     ):
+        self._pause_requested = False
+        self._resume_requested = False
+
         with tqdm(
             total=len(self.timestamps),
             bar_format="{l_bar}%s{bar}%s{r_bar}" % (Fore.CYAN, Fore.RESET),
             ascii=False,
             dynamic_ncols=True,
         ) as pbar:
-
             for start_index in range(0, len(self.timestamps), points_per_upload):
+                # If paused, wait until resumed
+                while self._pause_requested and not self._resume_requested:
+                    time.sleep(0.1)  # Small sleep to prevent CPU spinning
+
                 start_time = datetime.now()
                 end_index = min(start_index + points_per_upload, len(self.timestamps))
 
@@ -91,18 +102,18 @@ class LiveUploader:
                     start_index, end_index
                 )
 
-                live_data_points = []
-
-                for ds_idx, _ in enumerate(datastreams):
-                    avg_data = processed_data[ds_idx][0]["avg"][start_index // points_per_upload]
-                    live_data_points.extend(
-                        self._create_live_data_points(
-                            avg_data,
-                            avg_timestamp_ns,
-                        )
-                    )
+                avg_data = processed_data[start_index // points_per_upload]
+                live_data_points = self._create_live_data_points(
+                    avg_data,
+                    avg_timestamp_ns,
+                )
 
                 self._write_live_data_points(client, live_data_points)
+
+                # Check pause condition before sleeping
+                while self._pause_requested and not self._resume_requested:
+                    time.sleep(0.1)  # Small sleep to prevent CPU spinning
+
                 self._sleep_until_next_interval(start_time, upload_interval)
 
     def set_timestamps(
@@ -204,18 +215,16 @@ class LiveUploader:
         except InfluxDBClientError as e:
             print(f"Failed to clear the measurement: {e}")
 
-    def _preprocess_data(self, data_arrays, points_per_upload):
-        processed_data = []
-        for data in data_arrays:
-            avg_data = np.array([
+    def _preprocess_data(self, data_array, points_per_upload):
+        return np.array(
+            [
                 np.round(
-                    np.mean(data[:, i:i+points_per_upload], axis=1),
+                    np.mean(data_array[:, i : i + points_per_upload], axis=1),
                     decimals=2,
                 )
-                for i in range(0, data.shape[1], points_per_upload)
-            ])
-            processed_data.append([{"avg": avg_data}]) 
-        return processed_data
+                for i in range(0, data_array.shape[1], points_per_upload)
+            ]
+        )
 
     def _calculate_average_timestamp(self, start_index, end_index):
         avg_timestamp = sum(
@@ -228,12 +237,25 @@ class LiveUploader:
     def _sleep_until_next_interval(self, start_time, upload_interval):
         elapsed_time = (datetime.now() - start_time).total_seconds()
         remaining_sleep_time = max(0, upload_interval - elapsed_time)
-        time.sleep(remaining_sleep_time)
+
+        # Break sleep into smaller chunks to check for pause condition
+        chunk_size = 0.04  # Check every 40ms
+        sleep_chunks = int(remaining_sleep_time / chunk_size)
+        remaining_fraction = remaining_sleep_time % chunk_size
+
+        for _ in range(sleep_chunks):
+            if self._pause_requested and not self._resume_requested:
+                while self._pause_requested and not self._resume_requested:
+                    time.sleep(0.1)
+            time.sleep(chunk_size)
+
+        if remaining_fraction > 0:
+            time.sleep(remaining_fraction)
 
     def _create_live_data_points(self, data, timestamp):
         def escape_quotes(s):
             return s.replace('"', '\\"')
-        
+
         return [
             f'{self.measurement_name} channel_data="{escape_quotes(str(data.tolist()).replace(" ", ""))}" {timestamp}'
         ]

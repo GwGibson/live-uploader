@@ -15,17 +15,14 @@ def get_amplitudes(path):
     sensor_means = np.mean(amplitudes, axis=1, keepdims=True)
     amplitudes = amplitudes - sensor_means
     # Trimming after processing here to ensure spikes are more visible
-    start_idx = len(amplitudes[0])//4 # Start at ~ 15s
+    start_idx = len(amplitudes[0]) // 4  # Start at ~ 15s
     amplitudes = amplitudes[:, start_idx:]
     timestamps = timestamps[start_idx:]
     return amplitudes, timestamps
 
 
 def main():
-    amplitudes, timestamps = get_amplitudes("data/test_tstream_1736805171_001")
-
-    sensor_means = np.mean(amplitudes, axis=1, keepdims=True)
-    amplitudes = amplitudes - sensor_means
+    amplitudes, timestamps = get_amplitudes("data/test_tstream_1736805171_001.npy")
 
     global_min = np.min(amplitudes)
     global_max = np.max(amplitudes)
