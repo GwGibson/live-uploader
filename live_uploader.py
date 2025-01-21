@@ -7,8 +7,6 @@ from influxdb.exceptions import InfluxDBClientError
 from tqdm import tqdm
 
 
-# TODO: Mechanism to acquire portions of data from the files
-# as entire files will be too big to load into memory
 class LiveUploader:
     def __init__(self, influxdb_client=None):
         self.influxdb_client = influxdb_client if influxdb_client else InfluxDBClient
@@ -34,11 +32,7 @@ class LiveUploader:
         self._resume_requested = True
         self._pause_requested = False
 
-    def upload(
-        self,
-        datastream,
-        upload_interval,
-    ):
+    def upload(self, datastream, upload_interval, progress_callback=None):
         if not self.timestamps_set:
             raise RuntimeError("Timestamps not set.")
         if not self.database_details_set:
@@ -46,6 +40,7 @@ class LiveUploader:
         if not self.timestamps or len(self.timestamps) <= 1:
             raise ValueError("Timestamps list must contain at least two elements.")
 
+        # Assumes equal time intervals between timestamps for all data points
         data_point_interval = (self.timestamps[1] - self.timestamps[0]).total_seconds()
 
         if data_point_interval > upload_interval:
@@ -66,6 +61,7 @@ class LiveUploader:
             processed_data,
             points_per_upload,
             upload_interval,
+            progress_callback,
         )
 
     def _perform_live_upload(
@@ -74,47 +70,89 @@ class LiveUploader:
         processed_data,
         points_per_upload,
         upload_interval,
+        progress_callback=None,
     ):
         self._pause_requested = False
         self._resume_requested = False
+        total_points = len(self.timestamps)
 
-        with tqdm(
-            total=len(self.timestamps),
-            bar_format="{l_bar}%s{bar}%s{r_bar}" % (Fore.CYAN, Fore.RESET),
-            ascii=False,
-            dynamic_ncols=True,
-        ) as pbar:
-            for start_index in range(0, len(self.timestamps), points_per_upload):
-                # If paused, wait until resumed
-                while self._pause_requested and not self._resume_requested:
-                    time.sleep(0.1)  # Small sleep to prevent CPU spinning
-
-                start_time = datetime.now()
-                end_index = min(start_index + points_per_upload, len(self.timestamps))
-
-                pbar.set_description(
-                    f"Uploading the mean of {len(self.timestamps[start_index:end_index])} data points "
-                    f"from {self.timestamps[start_index]} to {self.timestamps[end_index-1]}",
+        if progress_callback is None:
+            # Use tqdm for default progress bar
+            with tqdm(
+                total=total_points,
+                bar_format="{l_bar}%s{bar}%s{r_bar}" % (Fore.CYAN, Fore.RESET),
+                ascii=False,
+                dynamic_ncols=True,
+            ) as pbar:
+                self._process_uploads(
+                    client=client,
+                    processed_data=processed_data,
+                    points_per_upload=points_per_upload,
+                    upload_interval=upload_interval,
+                    progress_handler=lambda start_index, end_index: (
+                        pbar.set_description(
+                            f"Uploading the mean of {end_index - start_index} data points "
+                            f"from {self.timestamps[start_index]} to {self.timestamps[end_index-1]}"
+                        ),
+                        pbar.update(end_index - start_index),
+                    ),
                 )
-                pbar.update(end_index - start_index)
-
-                avg_timestamp_ns = self._calculate_average_timestamp(
-                    start_index, end_index
+        else:
+            # Use user-provided progress callback with current index
+            def progress_handler(start_index, end_index):
+                message = (
+                    f"Uploading data points {start_index} to {end_index} of {total_points} "
+                    f"({(end_index/total_points*100):.1f}%) - "
+                    f"From {self.timestamps[start_index]} to {self.timestamps[end_index-1]}"
                 )
+                progress_callback(message, start_index)
 
-                avg_data = processed_data[start_index // points_per_upload]
-                live_data_points = self._create_live_data_points(
-                    avg_data,
-                    avg_timestamp_ns,
-                )
+            self._process_uploads(
+                client=client,
+                processed_data=processed_data,
+                points_per_upload=points_per_upload,
+                upload_interval=upload_interval,
+                progress_handler=progress_handler,
+            )
 
-                self._write_live_data_points(client, live_data_points)
+    def _process_uploads(
+        self,
+        client,
+        processed_data,
+        points_per_upload,
+        upload_interval,
+        progress_handler,
+    ):
+        total_points = len(self.timestamps)
 
-                # Check pause condition before sleeping
-                while self._pause_requested and not self._resume_requested:
-                    time.sleep(0.1)  # Small sleep to prevent CPU spinning
+        for start_index in range(0, total_points, points_per_upload):
+            # If paused, wait until resumed
+            while self._pause_requested and not self._resume_requested:
+                time.sleep(0.1)
 
-                self._sleep_until_next_interval(start_time, upload_interval)
+            start_time = datetime.now()
+            end_index = min(start_index + points_per_upload, total_points)
+
+            # Call progress handler with current indices
+            progress_handler(start_index, end_index)
+
+            avg_timestamp_ns = self._calculate_average_timestamp(start_index, end_index)
+            avg_data = processed_data[start_index // points_per_upload]
+            live_data_points = self._create_live_data_points(
+                avg_data,
+                avg_timestamp_ns,
+            )
+
+            self._write_live_data_points(client, live_data_points)
+
+            while self._pause_requested and not self._resume_requested:
+                time.sleep(0.1)
+
+            self._sleep_until_next_interval(start_time, upload_interval)
+
+    def set_actual_timestamps(self, timestamps):
+        self.timestamps_set = True
+        self.timestamps = timestamps
 
     def set_timestamps(
         self,
