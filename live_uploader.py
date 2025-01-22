@@ -24,6 +24,19 @@ class LiveUploader:
         self.host = None
         self.port = None
 
+        self.current_index = 0
+        self._last_processed_index = 0
+
+    @property
+    def current_index(self):
+        return self.current_index
+
+    @current_index.setter
+    def current_index(self, value):
+        self._current_index = value
+        # Reset the last processed index when position changes
+        self._last_processed_index = value
+
     def pause_upload(self):
         self._pause_requested = True
         self._resume_requested = False
@@ -125,28 +138,42 @@ class LiveUploader:
     ):
         total_points = len(self.timestamps)
 
-        for start_index in range(0, total_points, points_per_upload):
+        while self._current_index < total_points:
             # If paused, wait until resumed
             while self._pause_requested and not self._resume_requested:
                 time.sleep(0.1)
+                # If position changed during pause, reset processing state
+                if self._current_index != self._last_processed_index:
+                    self._last_processed_index = self._current_index
+
+            # Align current index to points_per_upload boundary
+            aligned_position = (
+                self._current_index // points_per_upload
+            ) * points_per_upload
+            end_index = min(aligned_position + points_per_upload, total_points)
 
             start_time = datetime.now()
-            end_index = min(start_index + points_per_upload, total_points)
 
-            # Call progress handler with current indices
-            progress_handler(start_index, end_index)
+            # Calculate data chunk index
+            data_index = aligned_position // points_per_upload
+            if data_index < len(processed_data):
+                progress_handler(aligned_position, end_index)
 
-            avg_timestamp_ns = self._calculate_average_timestamp(start_index, end_index)
-            avg_data = processed_data[start_index // points_per_upload]
-            live_data_points = self._create_live_data_points(
-                avg_data,
-                avg_timestamp_ns,
-            )
+                avg_timestamp_ns = self._calculate_average_timestamp(
+                    aligned_position, end_index
+                )
+                avg_data = processed_data[data_index]
+                live_data_points = self._create_live_data_points(
+                    avg_data,
+                    avg_timestamp_ns,
+                )
 
-            self._write_live_data_points(client, live_data_points)
+                self._write_live_data_points(client, live_data_points)
 
-            while self._pause_requested and not self._resume_requested:
-                time.sleep(0.1)
+                # Only advance if no position change occurred
+                if self._current_index == self._last_processed_index:
+                    self._current_index = end_index
+                    self._last_processed_index = self._current_index
 
             self._sleep_until_next_interval(start_time, upload_interval)
 
@@ -250,7 +277,7 @@ class LiveUploader:
                 client.switch_database(self.database_name)
                 client.query(f'DROP MEASUREMENT "{self.measurement_name}"')
                 self.database_cleared = True
-        except InfluxDBClientError as e:
+        except (ConnectionError, InfluxDBClientError) as e:
             print(f"Failed to clear the measurement: {e}")
 
     def _preprocess_data(self, data_array, points_per_upload):
