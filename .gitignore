@@ -1,6 +1,4 @@
 data/
-# Temporary
-gui/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

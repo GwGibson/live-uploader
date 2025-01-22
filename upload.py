@@ -53,13 +53,14 @@ def start_live_upload(upload_type):
     # In seconds
     upload_interval = 0.1
     # Actual spacing between data points
-    data_point_interval = upload_interval / 2
+    data_point_interval = upload_interval
     # January 22, 2022 at 15:30:00 UTC
     # start_time = datetime(2022, 1, 22, 15, 30, 0, tzinfo=timezone.utc)
     # TODO: Add option to use actual timesteps here.
     live_uploader.set_timestamps(num_data_points, data_point_interval)
     live_uploader.clear_measurements()
     live_uploader.upload(datastream, upload_interval)
+    live_uploader.cleanup()
 
 
 def parse_upload_type(value):

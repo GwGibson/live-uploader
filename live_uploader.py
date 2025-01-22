@@ -13,8 +13,8 @@ class LiveUploader:
         self.timestamps_set = False
         self.database_details_set = False
         self.database_cleared = False
-        self._pause_requested = False
-        self._resume_requested = False
+        self.pause_requested = False
+        self.resume_requested = False
 
         self.logger = None
         self.timestamps = None
@@ -27,9 +27,16 @@ class LiveUploader:
         self.current_index = 0
         self._last_processed_index = 0
 
+        # Members for upload state
+        self.client = None
+        self.processed_data = None
+        self.points_per_upload = None
+        self.upload_interval = None
+        self.initialized = False
+
     @property
     def current_index(self):
-        return self.current_index
+        return self._current_index
 
     @current_index.setter
     def current_index(self, value):
@@ -38,59 +45,70 @@ class LiveUploader:
         self._last_processed_index = value
 
     def pause_upload(self):
-        self._pause_requested = True
-        self._resume_requested = False
+        self.pause_requested = True
+        self.resume_requested = False
 
     def resume_upload(self):
-        self._resume_requested = True
-        self._pause_requested = False
+        self.resume_requested = True
+        self.pause_requested = False
+
+    def _initialize_upload(self, datastream, upload_interval):
+        """Initialize upload parameters if not already initialized."""
+        if not self.initialized:
+            if not self.timestamps_set:
+                raise RuntimeError("Timestamps not set.")
+            if not self.database_details_set:
+                raise RuntimeError("Database details not set.")
+            if not self.timestamps or len(self.timestamps) <= 1:
+                raise ValueError("Timestamps list must contain at least two elements.")
+
+            # Calculate intervals and process data
+            data_point_interval = (
+                self.timestamps[1] - self.timestamps[0]
+            ).total_seconds()
+            if data_point_interval > upload_interval:
+                raise ValueError("Data point frequency must be <= to upload frequency.")
+
+            # Initialize client
+            self.client = self.influxdb_client(self.host, self.port)
+            self.client.switch_database(self.database_name)
+
+            # Store upload parameters
+            self.upload_interval = upload_interval
+            self.points_per_upload = int(upload_interval / data_point_interval)
+            self.processed_data = self._preprocess_data(
+                datastream.data, self.points_per_upload
+            )
+            self.initialized = True
 
     def upload(self, datastream, upload_interval, progress_callback=None):
-        if not self.timestamps_set:
-            raise RuntimeError("Timestamps not set.")
-        if not self.database_details_set:
-            raise RuntimeError("Database details not set.")
-        if not self.timestamps or len(self.timestamps) <= 1:
-            raise ValueError("Timestamps list must contain at least two elements.")
-
-        # Assumes equal time intervals between timestamps for all data points
-        data_point_interval = (self.timestamps[1] - self.timestamps[0]).total_seconds()
-
-        if data_point_interval > upload_interval:
-            raise ValueError("Data point frequency must be <= to upload frequency.")
+        """Start continuous upload process."""
+        self._initialize_upload(datastream, upload_interval)
 
         if not self.database_cleared:
             print("Warning: Database not cleared before upload.")
-
         self.database_cleared = False
-        client = self.influxdb_client(self.host, self.port)
-        client.switch_database(self.database_name)
 
-        points_per_upload = int(upload_interval / data_point_interval)
-        processed_data = self._preprocess_data(datastream.data, points_per_upload)
+        self._perform_live_upload(progress_callback)
 
-        self._perform_live_upload(
-            client,
-            processed_data,
-            points_per_upload,
-            upload_interval,
-            progress_callback,
-        )
+    def upload_single_point(self, progress_callback=None):
+        """Upload a single point at the current index."""
+        if not self.initialized:
+            return
 
-    def _perform_live_upload(
-        self,
-        client,
-        processed_data,
-        points_per_upload,
-        upload_interval,
-        progress_callback=None,
-    ):
-        self._pause_requested = False
-        self._resume_requested = False
+        def single_point_progress(start_index, end_index):
+            if progress_callback:
+                message = f"Uploading point {self.current_index}"
+                progress_callback(message, self.current_index)
+
+        self._process_single_upload(single_point_progress)
+
+    def _perform_live_upload(self, progress_callback=None):
+        self.pause_requested = False
+        self.resume_requested = False
         total_points = len(self.timestamps)
 
         if progress_callback is None:
-            # Use tqdm for default progress bar
             with tqdm(
                 total=total_points,
                 bar_format="{l_bar}%s{bar}%s{r_bar}" % (Fore.CYAN, Fore.RESET),
@@ -98,84 +116,65 @@ class LiveUploader:
                 dynamic_ncols=True,
             ) as pbar:
                 self._process_uploads(
-                    client=client,
-                    processed_data=processed_data,
-                    points_per_upload=points_per_upload,
-                    upload_interval=upload_interval,
                     progress_handler=lambda start_index, end_index: (
                         pbar.set_description(
-                            f"Uploading the mean of {end_index - start_index} data points "
+                            f"Uploading the mean of {end_index - start_index} data point(s) "
                             f"from {self.timestamps[start_index]} to {self.timestamps[end_index-1]}"
                         ),
                         pbar.update(end_index - start_index),
                     ),
                 )
         else:
-            # Use user-provided progress callback with current index
             def progress_handler(start_index, end_index):
                 message = (
-                    f"Uploading data points {start_index} to {end_index} of {total_points} "
+                    f"Uploading data points {start_index} to {end_index-1} of {total_points} "
                     f"({(end_index/total_points*100):.1f}%) - "
                     f"From {self.timestamps[start_index]} to {self.timestamps[end_index-1]}"
                 )
                 progress_callback(message, start_index)
 
-            self._process_uploads(
-                client=client,
-                processed_data=processed_data,
-                points_per_upload=points_per_upload,
-                upload_interval=upload_interval,
-                progress_handler=progress_handler,
-            )
+            self._process_uploads(progress_handler=progress_handler)
 
-    def _process_uploads(
-        self,
-        client,
-        processed_data,
-        points_per_upload,
-        upload_interval,
-        progress_handler,
-    ):
+    def _process_uploads(self, progress_handler):
         total_points = len(self.timestamps)
 
         while self._current_index < total_points:
-            # If paused, wait until resumed
-            while self._pause_requested and not self._resume_requested:
+            while self.pause_requested and not self.resume_requested:
                 time.sleep(0.1)
-                # If position changed during pause, reset processing state
                 if self._current_index != self._last_processed_index:
                     self._last_processed_index = self._current_index
 
-            # Align current index to points_per_upload boundary
-            aligned_position = (
-                self._current_index // points_per_upload
-            ) * points_per_upload
-            end_index = min(aligned_position + points_per_upload, total_points)
-
             start_time = datetime.now()
+            self._process_single_upload(progress_handler)
+            self._sleep_until_next_interval(start_time, self.upload_interval)
 
-            # Calculate data chunk index
-            data_index = aligned_position // points_per_upload
-            if data_index < len(processed_data):
-                progress_handler(aligned_position, end_index)
+    def _process_single_upload(self, progress_handler):
+        """Process a single upload chunk at the current index."""
+        total_points = len(self.timestamps)
 
-                avg_timestamp_ns = self._calculate_average_timestamp(
-                    aligned_position, end_index
-                )
-                avg_data = processed_data[data_index]
-                live_data_points = self._create_live_data_points(
-                    avg_data,
-                    avg_timestamp_ns,
-                )
+        aligned_position = (
+            self._current_index // self.points_per_upload
+        ) * self.points_per_upload
+        end_index = min(aligned_position + self.points_per_upload, total_points)
 
-                self._write_live_data_points(client, live_data_points)
+        data_index = aligned_position // self.points_per_upload
+        if data_index < len(self.processed_data):
+            progress_handler(aligned_position, end_index)
 
-                # Only advance if no position change occurred
-                if self._current_index == self._last_processed_index:
-                    self._current_index = end_index
-                    self._last_processed_index = self._current_index
+            avg_timestamp_ns = self._calculate_average_timestamp(
+                aligned_position, end_index
+            )
+            avg_data = self.processed_data[data_index]
+            live_data_points = self._create_live_data_points(
+                avg_data,
+                avg_timestamp_ns,
+            )
 
-            self._sleep_until_next_interval(start_time, upload_interval)
+            self._write_live_data_points(self.client, live_data_points)
+
+            if self._current_index == self._last_processed_index:
+                self._current_index = end_index
+                self._last_processed_index = self._current_index
 
     def set_actual_timestamps(self, timestamps):
         self.timestamps_set = True
@@ -309,8 +308,8 @@ class LiveUploader:
         remaining_fraction = remaining_sleep_time % chunk_size
 
         for _ in range(sleep_chunks):
-            if self._pause_requested and not self._resume_requested:
-                while self._pause_requested and not self._resume_requested:
+            if self.pause_requested and not self.resume_requested:
+                while self.pause_requested and not self.resume_requested:
                     time.sleep(0.1)
             time.sleep(chunk_size)
 
@@ -328,3 +327,13 @@ class LiveUploader:
     def _write_live_data_points(self, client, data_points):
         all_data_points = "\n".join(data_points)
         client.write_points(all_data_points, protocol="line")
+
+    def cleanup(self):
+        """Cleanup resources."""
+        if self.client:
+            self.client.close()
+            self.client = None
+        self.initialized = False
+        self.processed_data = None
+        self.points_per_upload = None
+        self.upload_interval = None
