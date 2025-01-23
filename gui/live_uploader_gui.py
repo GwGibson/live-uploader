@@ -28,7 +28,7 @@ class Datastream:
 class LiveUploaderGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.live_uploader = None
+        self.live_uploader = None # should inject this
         self.current_index = 0
         self.is_playing = False
         self.data_loaded = False
@@ -95,7 +95,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.database_thread.error.connect(self._handle_settings_error)
             self.database_thread.finished.connect(self._cleanup_db_thread)
 
-            # Show loading state
             self.status_label.setText("Connecting to database...")
             self.disable_all_controls()
 
@@ -177,7 +176,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                 self.status_label.setText(f"Error loading file: {str(e)}")
 
     def unload_data(self):
-
         self._set_initial_control_states()
         self.current_index = 0
         self.datastream = None
