@@ -28,7 +28,7 @@ class Datastream:
 class LiveUploaderGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.live_uploader = None # should inject this
+        self.live_uploader = None  # should inject this
         self.current_index = 0
         self.is_playing = False
         self.data_loaded = False
@@ -147,7 +147,12 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
 
                 if self.actual_timestamps_check.isChecked() and timestamps is not None:
                     # Use actualy timestamps if available
-                    self.live_uploader.timestamps = timestamps
+                    self.live_uploader.set_actual_timestamps(
+                        [
+                            datetime.fromtimestamp(ts, tz=timezone.utc)
+                            for ts in timestamps
+                        ]
+                    )
                     self.live_uploader.timestamps_set = True
                 else:
                     # Generate timestamps using interval

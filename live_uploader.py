@@ -125,6 +125,7 @@ class LiveUploader:
                     ),
                 )
         else:
+
             def progress_handler(start_index, end_index):
                 message = (
                     f"Uploading data points {start_index} to {end_index-1} of {total_points} "
