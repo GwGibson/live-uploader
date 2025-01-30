@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum, auto
 import sys
 import numpy as np
 from PyQt6 import QtWidgets, QtCore
@@ -7,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCursor
 
 from live_uploader import LiveUploader
-from parse import get_amplitudes
+from parse import DataProcessingError, get_amplitudes, get_phases
 
 from gui.database_thread import DatabaseThread
 from gui.styles import Styles
@@ -19,16 +20,29 @@ from gui.uploader_thread import UploaderThread
 # run python -m gui.live_uploader_gui from root directory
 
 
+class StreamType(Enum):
+    AMPLITUDES = auto()
+    PHASES = auto()
+    # DFS = auto()
+
+    def __str__(self):
+        return self.name
+
+
 @dataclass
 class Datastream:
-    stream: str
+    stream: StreamType
     data: np.ndarray
+
+    def __post_init__(self):
+        if isinstance(self.stream, StreamType):
+            self.stream = self.stream.name
 
 
 class LiveUploaderGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.live_uploader = None  # should inject this
+        self.live_uploader = LiveUploader()  # should inject this
         self.current_index = 0
         self.is_playing = False
         self.data_loaded = False
@@ -42,12 +56,25 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
 
         # Initialize Control UI elements
         # TODO: These should be in a container or something to make it easier to manage
+        self.data_type_group = None
+        self.amplitude_radio = None
+        self.phase_radio = None
         self.load_button = None
         self.unload_button = None
         self.settings_button = None
+
+        self.process_button = None
+        self.center_mean_check = None
+        self.filter_check = None
+        self.threshold_spin = None
+        self.scale_factor_spin = None
+        self.min_value_label = None
+        self.max_value_label = None
+
         self.actual_timestamps_check = None
         self.timestamp_interval_spin = None
         self.upload_interval_spin = None
+
         self.prev_button = None
         self.play_button = None
         self.next_button = None
@@ -56,6 +83,10 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         # Labels
         self.progress_label = None
         self.status_label = None
+
+        # Data storage
+        self.raw_data = None
+        self.timestamps = None
 
         self.init_ui()
         self._set_initial_control_states()
@@ -122,13 +153,29 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.timeline_slider,
             self.unload_button,
             self.settings_button,
+            self.process_button,
+            self.center_mean_check,
+            self.filter_check,
         ]:
             control.setEnabled(True)
+        
+        if self.filter_check.isChecked():
+            self.threshold_spin.setEnabled(True)
+            self.scale_factor_spin.setEnabled(True)
 
     def _handle_settings_error(self, error_msg):
         """Handle database settings error"""
         self.status_label.setText(f"Database error: {error_msg}")
         self._set_initial_control_states()
+
+    # Lets assume this is a closed set with a max of 3 (missing df's)
+    # Otherwise we should rework this so adding more data types can be done in one place
+    def get_selected_data_type(self):
+        """Get the currently selected data type."""
+        if self.amplitude_radio.isChecked():
+            return StreamType.AMPLITUDES
+        elif self.phase_radio.isChecked():
+            return StreamType.PHASES
 
     def load_data(self):
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -137,60 +184,121 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
 
         if file_name:
             try:
-                self.live_uploader = LiveUploader()
-                amplitudes, timestamps = get_amplitudes(file_name)
-                # TODO: Allow amplitudes, phases, dfs
-                self.datastream = Datastream(stream="AMPLITUDES", data=amplitudes)
-
-                # Setup timestamps based on checkbox state
-                num_data_points = len(self.datastream.data[0])
-
-                if self.actual_timestamps_check.isChecked() and timestamps is not None:
-                    # Use actualy timestamps if available
-                    self.live_uploader.set_actual_timestamps(
-                        [
-                            datetime.fromtimestamp(ts, tz=timezone.utc)
-                            for ts in timestamps
-                        ]
-                    )
-                    self.live_uploader.timestamps_set = True
-                else:
-                    # Generate timestamps using interval
-                    data_point_interval = self.timestamp_interval_spin.value()
-                    self.live_uploader.set_timestamps(
-                        num_data_points,
-                        data_point_interval,
-                        start_date=datetime.now(timezone.utc),
-                    )
-
-                self.timeline_slider.setMaximum(num_data_points - 1)
-                self.status_label.setText(f"Loaded: {file_name}")
-                self.data_loaded = True
-                # Should rework this - basically want to enable play controls and slider and disable upload settings
-                # Should an unload data option so user can adjust those.
+                self.raw_data = np.load(file_name)
+                self._process_data()
+                
+                # Update UI states after successful loading
                 self.disable_all_controls()
+                self.enable_data_processing_controls()
                 for control in [
                     self.unload_button,
                     self.settings_button,
+                    self.process_button,  # Enable the process button
                 ]:
                     control.setEnabled(True)
 
-            # TODO, should not worry about parsine errors here. Need this to happen when user selects
-            # amplitude/phase etc.
-            except (ValueError, OSError, RuntimeError, np.AxisError) as e:
+                self.status_label.setText(f"{self.datastream.stream} data loaded successfully")
+            except (ValueError, OSError, RuntimeError) as e:
                 self.status_label.setText(f"Error loading file: {str(e)}")
+                self.unload_data()
+
+    def _process_data(self):
+        """Process data with current settings and set up the uploader."""
+        try:
+            # Get current processing settings
+            center = self.center_mean_check.isChecked()
+            filter_outliers = self.filter_check.isChecked()
+            threshold = self.threshold_spin.value() if filter_outliers else None
+            scale_factor = self.scale_factor_spin.value() if filter_outliers else None
+
+            stream_type = self.get_selected_data_type()
+
+            if stream_type == StreamType.AMPLITUDES:
+                data, timestamps = get_amplitudes(
+                    self.raw_data,
+                    center=center,
+                    filter_outliers=filter_outliers,
+                    threshold=threshold,
+                    scale_factor=scale_factor,
+                )
+            elif stream_type == StreamType.PHASES:
+                data, timestamps = get_phases(
+                    self.raw_data,
+                    center=center,
+                    filter_outliers=filter_outliers,
+                    threshold=threshold,
+                    scale_factor=scale_factor,
+                )
+            else:
+                raise DataProcessingError("Unsupported data type")
+            
+            self.datastream = Datastream(stream_type, data)
+            self.timestamps = timestamps
+            self._update_min_max_display(data)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to process data: {str(e)}") from e
+
+    def _setup_uploader(self):
+        """Set up the uploader with current data"""
+        try:
+            if self.datastream is None or self.datastream.data is None:
+                raise ValueError("No data available")
+
+            # Get number of data points from first row/channel of data
+            if len(self.datastream.data.shape) < 2:
+                raise ValueError("Data must be 2-dimensional")
+
+            num_data_points = len(self.datastream.data[0])
+            if num_data_points == 0:
+                raise ValueError("No data points available")
+
+            if self.actual_timestamps_check.isChecked():
+                if self.timestamps is None:
+                    raise ValueError(
+                        "No timestamps available for actual timestamp mode"
+                    )
+                self.live_uploader.set_actual_timestamps(
+                    [
+                        datetime.fromtimestamp(ts, tz=timezone.utc)
+                        for ts in self.timestamps
+                    ]
+                )
+                self.live_uploader.timestamps_set = True
+            else:
+                data_point_interval = self.timestamp_interval_spin.value()
+                if data_point_interval <= 0:
+                    raise ValueError("Invalid data point interval")
+                self.live_uploader.set_timestamps(
+                    num_data_points,
+                    data_point_interval,
+                    start_date=datetime.now(timezone.utc),
+                )
+
+            self.timeline_slider.setMaximum(num_data_points - 1)
+            self.status_label.setText(f"Loaded: {self.datastream.stream}")
+            self.data_loaded = True
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to setup uploader: {str(e)}") from e
 
     def unload_data(self):
+        if self.uploader_thread:
+            self.uploader_thread.stop()
+            self.uploader_thread = None
+
         self._set_initial_control_states()
         self.current_index = 0
         self.datastream = None
         self.data_loaded = False
         self.timeline_slider.setMaximum(0)
+        self._update_min_max_display(None)
+        self.raw_data = None
+        self.timestamps = None
+        self.progress_label.setText("")
         if self.live_uploader:
-            if self.db_settings:
-                self.live_uploader.clear_measurements()
             self.live_uploader.cleanup()
-            self.live_uploader = None
+            self.live_uploader = LiveUploader()
         self.status_label.setText("Data unloaded")
 
     def toggle_play(self):
@@ -204,14 +312,17 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         if self.is_playing:
             self.disable_all_controls()
             self.play_button.setEnabled(True)  # Allow pausing
-            if self.uploader_thread and self.uploader_thread.isRunning():
-                # Resume existing upload, but sync to current slider position first
-                self.uploader_thread.set_index(self.current_index)
-                self.uploader_thread.resume()
-                self.status_label.setText("Upload resumed")
-            else:
-                # Start new upload
-                try:
+            
+            try:
+                self._setup_uploader()
+                
+                if self.uploader_thread and self.uploader_thread.isRunning():
+                    # Resume existing upload, but sync to current slider position first
+                    self.uploader_thread.set_index(self.current_index)
+                    self.uploader_thread.resume()
+                    self.status_label.setText("Upload resumed")
+                else:
+                    # Start new upload
                     self.uploader_thread = UploaderThread(
                         self.live_uploader,
                         self.datastream,
@@ -227,9 +338,9 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                     )
                     self.uploader_thread.start()
                     self.status_label.setText("Upload started")
-                except Exception as e:
-                    self.handle_upload_error(f"Failed to start upload: {str(e)}")
-                    return
+            except (ValueError, RuntimeError, ConnectionError) as e:
+                self.handle_upload_error(f"Failed to start upload: {str(e)}")
+                return
         else:
             # Pause the upload if it's running
             if self.uploader_thread and self.uploader_thread.isRunning():
@@ -262,6 +373,7 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
     def handle_upload_error(self, error_msg):
         self.status_label.setText(f"Upload error: {error_msg}")
         self.is_playing = False
+        self.unload_button.setEnabled(True)  # Allow user to unload after an error.
         self.play_button.setText("▶")
 
     def update_slider_position(self, position):
@@ -313,12 +425,29 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.actual_timestamps_check.setEnabled(True)
         self.timestamp_interval_spin.setEnabled(True)
         self.upload_interval_spin.setEnabled(True)
+        self.data_type_group.setEnabled(True)
+
+    def enable_data_processing_controls(self):
+        """Enable data processing controls."""
+        for control in [
+            self.process_button,
+            self.center_mean_check,
+            self.filter_check,
+        ]:
+            control.setEnabled(True)
 
     def disable_all_controls(self):
+        """Disable all controls."""
         for control in [
             self.load_button,
             self.unload_button,
             self.settings_button,
+            self.process_button,
+            self.data_type_group,
+            self.center_mean_check,
+            self.filter_check,
+            self.threshold_spin,
+            self.scale_factor_spin,
             self.actual_timestamps_check,
             self.timestamp_interval_spin,
             self.upload_interval_spin,
@@ -331,13 +460,14 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                 control.setEnabled(False)
 
     def _create_top_section(self):
-        """Create the top section with input and upload settings."""
+        """Create the top section with input, processing, and upload settings."""
         top_section = QtWidgets.QHBoxLayout()
         top_section.setSpacing(20)
 
+        # Add the three main sections
         top_section.addWidget(self._create_input_settings())
-        top_section.addStretch(1)
         top_section.addWidget(self._create_upload_settings())
+        top_section.addWidget(self._create_data_processing())
 
         return top_section
 
@@ -347,6 +477,17 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout()
         layout.setSpacing(10)
         layout.setContentsMargins(15, 10, 15, 10)
+
+        # Data Type Selection
+        self.data_type_group = QtWidgets.QGroupBox("Data Type")
+        radio_layout = QtWidgets.QHBoxLayout()
+        self.amplitude_radio = QtWidgets.QRadioButton("Amplitudes")
+        self.phase_radio = QtWidgets.QRadioButton("Phases")
+        self.amplitude_radio.setChecked(True)
+        radio_layout.addWidget(self.amplitude_radio)
+        radio_layout.addWidget(self.phase_radio)
+        self.data_type_group.setLayout(radio_layout)
+        layout.addWidget(self.data_type_group)
 
         # Load Data File button
         self.load_button = QtWidgets.QPushButton("Load Data File")
@@ -362,14 +503,125 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.unload_button.clicked.connect(self.unload_data)
         layout.addWidget(self.unload_button)
 
-        # Database Settings button
-        self.settings_button = QtWidgets.QPushButton("Database Settings")
-        self.settings_button.setFixedHeight(30)
-        self.settings_button.clicked.connect(self.show_database_settings)
-        layout.addWidget(self.settings_button)
+        group.setLayout(layout)
+        return group
+
+    def _create_data_processing(self):
+        """Create the data processing settings group."""
+        group = UIComponents.create_group_box("Data Processing", Styles.GROUP_BOX)
+
+        # Make the group box more compact
+        group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+
+        layout = QtWidgets.QVBoxLayout()
+        # Reduce overall margins
+        layout.setContentsMargins(10, 5, 10, 5)  # Left, Top, Right, Bottom
+        layout.setSpacing(5)  # Reduce spacing between elements
+
+        # Process Data button at the top
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()  # Add stretch before button
+
+        self.process_button = QtWidgets.QPushButton("Process Data")
+        self.process_button.setFixedHeight(25)
+        self.process_button.setFixedWidth(100)
+        self.process_button.setEnabled(False)
+        self.process_button.clicked.connect(self._process_data)
+        button_layout.addWidget(self.process_button)
+
+        button_layout.addStretch()  # Add stretch after button
+        layout.addLayout(button_layout)
+
+        # Filter settings container with grid layout
+        filter_settings = QtWidgets.QWidget()
+        filter_layout = QtWidgets.QVBoxLayout()
+        filter_layout.setContentsMargins(5, 0, 5, 0)  # Reduced margins
+        filter_layout.setSpacing(2)  # Reduced spacing
+
+        grid_widget = QtWidgets.QWidget()
+        grid_layout = QtWidgets.QGridLayout()
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(10)  # Reduced spacing between grid elements
+
+        # Checkboxes - Row 0
+        self.center_mean_check = QtWidgets.QCheckBox("Center Around Mean")
+        self.center_mean_check.setChecked(False)
+        grid_layout.addWidget(self.center_mean_check, 0, 0, 1, 2)
+
+        self.filter_check = QtWidgets.QCheckBox("Filter Outliers")
+        self.filter_check.setChecked(False)
+        self.filter_check.stateChanged.connect(self._toggle_filter_settings)
+        grid_layout.addWidget(self.filter_check, 0, 2, 1, 2)
+
+        # Max Value - Row 1, Column 0-1
+        max_label = QtWidgets.QLabel("Max Value:")
+        grid_layout.addWidget(max_label, 1, 0)
+
+        self.max_value_label = QtWidgets.QLineEdit()
+        self.max_value_label.setReadOnly(True)
+        self.max_value_label.setFixedWidth(100)
+        self.max_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        grid_layout.addWidget(self.max_value_label, 1, 1)
+
+        # Threshold - Row 1, Column 2-3
+        threshold_label = QtWidgets.QLabel("Threshold:")
+        grid_layout.addWidget(threshold_label, 1, 2)
+
+        self.threshold_spin = QtWidgets.QSpinBox()
+        self.threshold_spin.setRange(1, 50)
+        self.threshold_spin.setValue(3)
+        self.threshold_spin.setSingleStep(1)
+        self.threshold_spin.setEnabled(False)
+        self.threshold_spin.setFixedWidth(70)
+        grid_layout.addWidget(self.threshold_spin, 1, 3)
+
+        # Min Value - Row 2, Column 0-1
+        min_label = QtWidgets.QLabel("Min Value:")
+        grid_layout.addWidget(min_label, 2, 0)
+
+        self.min_value_label = QtWidgets.QLineEdit()
+        self.min_value_label.setReadOnly(True)
+        self.min_value_label.setFixedWidth(100)
+        self.min_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        grid_layout.addWidget(self.min_value_label, 2, 1)
+
+        # Scale Factor - Row 2, Column 2-3
+        scale_label = QtWidgets.QLabel("Scale Factor:")
+        grid_layout.addWidget(scale_label, 2, 2)
+
+        self.scale_factor_spin = QtWidgets.QDoubleSpinBox()
+        self.scale_factor_spin.setRange(0, 1.0)
+        self.scale_factor_spin.setValue(0.67)
+        self.scale_factor_spin.setSingleStep(0.01)
+        self.scale_factor_spin.setDecimals(2)
+        self.scale_factor_spin.setEnabled(False)
+        self.scale_factor_spin.setFixedWidth(70)
+        grid_layout.addWidget(self.scale_factor_spin, 2, 3)
+
+        # Reduced stretching to keep things more compact
+        grid_layout.setColumnStretch(1, 0)
+        grid_layout.setColumnStretch(3, 0)
+
+        grid_widget.setLayout(grid_layout)
+        filter_layout.addWidget(grid_widget)
+        filter_settings.setLayout(filter_layout)
+        layout.addWidget(filter_settings)
 
         group.setLayout(layout)
         return group
+
+    def _update_min_max_display(self, data):
+        """Update the min/max display values."""
+        if data is not None:
+            min_val = np.nanmin(data)
+            max_val = np.nanmax(data)
+            self.min_value_label.setText(f"{min_val:.4f}")
+            self.max_value_label.setText(f"{max_val:.4f}")
+        else:
+            self.min_value_label.setText("")
+            self.max_value_label.setText("")
 
     def _create_upload_settings(self):
         """Create the upload settings group."""
@@ -398,20 +650,52 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             )
         )
 
+        # Database Settings button
+        self.settings_button = QtWidgets.QPushButton("Database Settings")
+        self.settings_button.setFixedHeight(30)
+        self.settings_button.clicked.connect(self.show_database_settings)
+        layout.addWidget(self.settings_button)
+
         group.setLayout(layout)
         return group
+
+    def _toggle_filter_settings(self, state):
+        """Enable/disable filter settings based on checkbox state"""
+        enabled = bool(state)
+        self.threshold_spin.setEnabled(enabled)
+        self.scale_factor_spin.setEnabled(enabled)
 
     def _create_data_point_spinbox(self):
         """Create the data point interval spin box."""
         self.timestamp_interval_spin = UIComponents.create_spin_box(
             0.01, 5.0, 0.05, 0.1
         )
+        self.timestamp_interval_spin.valueChanged.connect(
+            self._validate_interval_values
+        )
         return self.timestamp_interval_spin
 
     def _create_upload_spinbox(self):
         """Create the upload interval spin box."""
         self.upload_interval_spin = UIComponents.create_spin_box(0.05, 5.0, 0.05, 0.1)
+        self.upload_interval_spin.valueChanged.connect(self._validate_interval_values)
         return self.upload_interval_spin
+
+    def _validate_interval_values(self, _):
+        """
+        Validate that timestamp interval doesn't exceed upload interval.
+        Automatically adjusts timestamp interval if it exceeds upload interval.
+        """
+        if self.timestamp_interval_spin and self.upload_interval_spin:
+            timestamp_value = self.timestamp_interval_spin.value()
+            upload_value = self.upload_interval_spin.value()
+
+            if timestamp_value > upload_value:
+                # Set timestamp interval to match upload interval
+                self.timestamp_interval_spin.setValue(upload_value)
+
+            # Update maximum value of timestamp interval
+            self.timestamp_interval_spin.setMaximum(upload_value)
 
     def _create_interval_widget(self, label_text, spin_box):
         """Create a widget combining a label and spin box."""
@@ -484,6 +768,7 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.next_button.setEnabled(True)
             self.timeline_slider.setEnabled(True)
             self.unload_button.setEnabled(True)
+            self.progress_label.setText("")
             self.status_label.setText("Ready to resume")
             timer.deleteLater()
 
