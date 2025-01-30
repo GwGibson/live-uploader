@@ -9,6 +9,7 @@ from PyQt6.QtGui import QCursor
 
 from live_uploader import LiveUploader
 from parse import DataProcessingError, get_amplitudes, get_phases
+from plot import PlotCanvas
 
 from gui.database_thread import DatabaseThread
 from gui.styles import Styles
@@ -42,7 +43,9 @@ class Datastream:
 class LiveUploaderGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.live_uploader = LiveUploader()  # should inject this
+        self.live_uploader = (
+            LiveUploader()
+        )  # should inject this, eventually want to skip the db and go file -> live_viewer
         self.current_index = 0
         self.is_playing = False
         self.data_loaded = False
@@ -88,33 +91,38 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.raw_data = None
         self.timestamps = None
 
+        self.plot_canvas = None
+
         self.init_ui()
         self._set_initial_control_states()
 
     def init_ui(self):
         """Initialize the main UI components."""
         self.setWindowTitle("Live Uploader")
-        self.setGeometry(100, 100, 900, 300)
+        self.setGeometry(100, 100, 800, 500)
 
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QtWidgets.QVBoxLayout()
 
-        # Create and add UI sections
+        # Top input controls
         main_layout.addLayout(self._create_top_section())
+        # Rewind, Play/Pause, Fast Forward
         main_layout.addLayout(self._create_playback_section())
-        main_layout.addWidget(self._create_timeline_section())
+        # Slider / Canvas
+        visualization_container = self._create_visualization_section()
+        main_layout.addWidget(visualization_container)
+        main_layout.addWidget(self.plot_canvas)
+        # Status text
         main_layout.addWidget(self._create_status_section())
 
         main_widget.setLayout(main_layout)
 
     def toggle_timestamp_mode(self, state):
-        """Enable/disable interval input based on checkbox state"""
         use_real_timestamps = bool(state)
         self.timestamp_interval_spin.setEnabled(not use_real_timestamps)
 
     def show_database_settings(self):
-        """Show the database settings dialog"""
         dialog = DatabaseSettingsDialog(self, self.db_settings)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             new_settings = dialog.get_settings()
@@ -158,7 +166,7 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.filter_check,
         ]:
             control.setEnabled(True)
-        
+
         if self.filter_check.isChecked():
             self.threshold_spin.setEnabled(True)
             self.scale_factor_spin.setEnabled(True)
@@ -186,7 +194,7 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             try:
                 self.raw_data = np.load(file_name)
                 self._process_data()
-                
+
                 # Update UI states after successful loading
                 self.disable_all_controls()
                 self.enable_data_processing_controls()
@@ -197,7 +205,9 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                 ]:
                     control.setEnabled(True)
 
-                self.status_label.setText(f"{self.datastream.stream} data loaded successfully")
+                self.status_label.setText(
+                    f"{self.datastream.stream} data loaded successfully"
+                )
             except (ValueError, OSError, RuntimeError) as e:
                 self.status_label.setText(f"Error loading file: {str(e)}")
                 self.unload_data()
@@ -231,10 +241,11 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                 )
             else:
                 raise DataProcessingError("Unsupported data type")
-            
+
             self.datastream = Datastream(stream_type, data)
             self.timestamps = timestamps
             self._update_min_max_display(data)
+            self.plot_canvas.update_plot(data)
 
         except Exception as e:
             raise RuntimeError(f"Failed to process data: {str(e)}") from e
@@ -296,6 +307,10 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.raw_data = None
         self.timestamps = None
         self.progress_label.setText("")
+
+        if self.plot_canvas:
+            self.plot_canvas.update_plot(None)
+
         if self.live_uploader:
             self.live_uploader.cleanup()
             self.live_uploader = LiveUploader()
@@ -312,10 +327,10 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         if self.is_playing:
             self.disable_all_controls()
             self.play_button.setEnabled(True)  # Allow pausing
-            
+
             try:
                 self._setup_uploader()
-                
+
                 if self.uploader_thread and self.uploader_thread.isRunning():
                     # Resume existing upload, but sync to current slider position first
                     self.uploader_thread.set_index(self.current_index)
@@ -348,6 +363,7 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
                 # Sync GUI with thread's actual position from the live uploader
                 self.current_index = self.uploader_thread.get_current_index()
                 self.timeline_slider.setValue(self.current_index)
+                self.progress_label.setText("")
                 self.status_label.setText(
                     f"Upload paused at index: {self.current_index}"
                 )
@@ -418,7 +434,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self._move_to_index(self.current_index + 1)
 
     def _set_initial_control_states(self):
-        """Set the initial enabled/disabled states of all controls."""
         self.disable_all_controls()
 
         self.load_button.setEnabled(True)
@@ -428,7 +443,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.data_type_group.setEnabled(True)
 
     def enable_data_processing_controls(self):
-        """Enable data processing controls."""
         for control in [
             self.process_button,
             self.center_mean_check,
@@ -437,7 +451,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             control.setEnabled(True)
 
     def disable_all_controls(self):
-        """Disable all controls."""
         for control in [
             self.load_button,
             self.unload_button,
@@ -472,7 +485,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return top_section
 
     def _create_input_settings(self):
-        """Create the input settings group."""
         group = UIComponents.create_group_box("Input Settings", Styles.GROUP_BOX)
         layout = QtWidgets.QVBoxLayout()
         layout.setSpacing(10)
@@ -507,7 +519,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return group
 
     def _create_data_processing(self):
-        """Create the data processing settings group."""
         group = UIComponents.create_group_box("Data Processing", Styles.GROUP_BOX)
 
         # Make the group box more compact
@@ -613,7 +624,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return group
 
     def _update_min_max_display(self, data):
-        """Update the min/max display values."""
         if data is not None:
             min_val = np.nanmin(data)
             max_val = np.nanmax(data)
@@ -624,7 +634,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.max_value_label.setText("")
 
     def _create_upload_settings(self):
-        """Create the upload settings group."""
         group = UIComponents.create_group_box("Upload Settings", Styles.GROUP_BOX)
         layout = QtWidgets.QVBoxLayout()
         layout.setSpacing(10)
@@ -660,13 +669,11 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return group
 
     def _toggle_filter_settings(self, state):
-        """Enable/disable filter settings based on checkbox state"""
         enabled = bool(state)
         self.threshold_spin.setEnabled(enabled)
         self.scale_factor_spin.setEnabled(enabled)
 
     def _create_data_point_spinbox(self):
-        """Create the data point interval spin box."""
         self.timestamp_interval_spin = UIComponents.create_spin_box(
             0.01, 5.0, 0.05, 0.1
         )
@@ -676,7 +683,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return self.timestamp_interval_spin
 
     def _create_upload_spinbox(self):
-        """Create the upload interval spin box."""
         self.upload_interval_spin = UIComponents.create_spin_box(0.05, 5.0, 0.05, 0.1)
         self.upload_interval_spin.valueChanged.connect(self._validate_interval_values)
         return self.upload_interval_spin
@@ -698,7 +704,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
             self.timestamp_interval_spin.setMaximum(upload_value)
 
     def _create_interval_widget(self, label_text, spin_box):
-        """Create a widget combining a label and spin box."""
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -712,7 +717,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         return widget
 
     def _create_playback_section(self):
-        """Create the playback controls section with fine control buttons."""
         layout = QtWidgets.QHBoxLayout()
         layout.addStretch()
 
@@ -737,23 +741,31 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         layout.addStretch()
         return layout
 
-    def _create_timeline_section(self):
-        """Create the timeline slider section."""
+    def _create_visualization_section(self):
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+        layout.setSpacing(0)
+        layout.setContentsMargins(20, 0, 20, 0)
+
         self.timeline_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.timeline_slider.setMinimum(0)
         self.timeline_slider.setMaximum(100)
-
         self.timeline_slider.sliderPressed.connect(self._slider_pressed)
         self.timeline_slider.sliderReleased.connect(self._slider_released)
         self.timeline_slider.valueChanged.connect(self.slider_moved)
+        layout.addWidget(self.timeline_slider)
 
-        return self.timeline_slider
+        # Create and add plot
+        self.plot_canvas = PlotCanvas(self, width=6, height=2)
+        layout.addWidget(self.plot_canvas)
+
+        container.setLayout(layout)
+        return container
 
     def _slider_pressed(self):
         self.is_user_sliding = True
 
     def _slider_released(self):
-        """Handle slider release with a delay to ensure upload completion"""
         self.disable_all_controls()  # Disable controls during the delay
         self.status_label.setText("Moving through time...")
 
@@ -777,7 +789,6 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         timer.start(300)
 
     def _create_status_section(self):
-        """Create the status and progress section."""
         status_widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
 
