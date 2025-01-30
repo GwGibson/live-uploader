@@ -73,6 +73,8 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.scale_factor_spin = None
         self.min_value_label = None
         self.max_value_label = None
+        self.avg_min_value_label = None
+        self.avg_max_value_label = None
 
         self.actual_timestamps_check = None
         self.timestamp_interval_spin = None
@@ -308,6 +310,9 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.timestamps = None
         self.progress_label.setText("")
 
+        self.filter_check.setChecked(False)
+        self.center_mean_check.setChecked(False)
+
         if self.plot_canvas:
             self.plot_canvas.update_plot(None)
 
@@ -520,20 +525,17 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
 
     def _create_data_processing(self):
         group = UIComponents.create_group_box("Data Processing", Styles.GROUP_BOX)
-
-        # Make the group box more compact
         group.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
         )
 
         layout = QtWidgets.QVBoxLayout()
-        # Reduce overall margins
-        layout.setContentsMargins(10, 5, 10, 5)  # Left, Top, Right, Bottom
-        layout.setSpacing(5)  # Reduce spacing between elements
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(5)
 
         # Process Data button at the top
         button_layout = QtWidgets.QHBoxLayout()
-        button_layout.addStretch()  # Add stretch before button
+        button_layout.addStretch()
 
         self.process_button = QtWidgets.QPushButton("Process Data")
         self.process_button.setFixedHeight(25)
@@ -542,66 +544,38 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.process_button.clicked.connect(self._process_data)
         button_layout.addWidget(self.process_button)
 
-        button_layout.addStretch()  # Add stretch after button
+        button_layout.addStretch()
         layout.addLayout(button_layout)
 
-        # Filter settings container with grid layout
-        filter_settings = QtWidgets.QWidget()
-        filter_layout = QtWidgets.QVBoxLayout()
-        filter_layout.setContentsMargins(5, 0, 5, 0)  # Reduced margins
-        filter_layout.setSpacing(2)  # Reduced spacing
-
+        # Main settings grid
         grid_widget = QtWidgets.QWidget()
         grid_layout = QtWidgets.QGridLayout()
-        grid_layout.setContentsMargins(0, 0, 0, 0)
-        grid_layout.setSpacing(10)  # Reduced spacing between grid elements
+        grid_layout.setContentsMargins(5, 0, 5, 0)
+        grid_layout.setSpacing(10)
 
-        # Checkboxes - Row 0
-        self.center_mean_check = QtWidgets.QCheckBox("Center Around Mean")
-        self.center_mean_check.setChecked(False)
-        grid_layout.addWidget(self.center_mean_check, 0, 0, 1, 2)
-
+        # Left column: Checkboxes
         self.filter_check = QtWidgets.QCheckBox("Filter Outliers")
         self.filter_check.setChecked(False)
         self.filter_check.stateChanged.connect(self._toggle_filter_settings)
-        grid_layout.addWidget(self.filter_check, 0, 2, 1, 2)
+        grid_layout.addWidget(self.filter_check, 0, 0)
 
-        # Max Value - Row 1, Column 0-1
-        max_label = QtWidgets.QLabel("Max Value:")
-        grid_layout.addWidget(max_label, 1, 0)
+        self.center_mean_check = QtWidgets.QCheckBox("Center Around Mean")
+        self.center_mean_check.setChecked(False)
+        grid_layout.addWidget(self.center_mean_check, 1, 0)
 
-        self.max_value_label = QtWidgets.QLineEdit()
-        self.max_value_label.setReadOnly(True)
-        self.max_value_label.setFixedWidth(100)
-        self.max_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-        grid_layout.addWidget(self.max_value_label, 1, 1)
-
-        # Threshold - Row 1, Column 2-3
+        # Right column: Threshold and Scale Factor controls
         threshold_label = QtWidgets.QLabel("Threshold:")
-        grid_layout.addWidget(threshold_label, 1, 2)
-
+        grid_layout.addWidget(threshold_label, 0, 1)
         self.threshold_spin = QtWidgets.QSpinBox()
         self.threshold_spin.setRange(1, 50)
         self.threshold_spin.setValue(3)
         self.threshold_spin.setSingleStep(1)
         self.threshold_spin.setEnabled(False)
         self.threshold_spin.setFixedWidth(70)
-        grid_layout.addWidget(self.threshold_spin, 1, 3)
+        grid_layout.addWidget(self.threshold_spin, 0, 2)
 
-        # Min Value - Row 2, Column 0-1
-        min_label = QtWidgets.QLabel("Min Value:")
-        grid_layout.addWidget(min_label, 2, 0)
-
-        self.min_value_label = QtWidgets.QLineEdit()
-        self.min_value_label.setReadOnly(True)
-        self.min_value_label.setFixedWidth(100)
-        self.min_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-        grid_layout.addWidget(self.min_value_label, 2, 1)
-
-        # Scale Factor - Row 2, Column 2-3
         scale_label = QtWidgets.QLabel("Scale Factor:")
-        grid_layout.addWidget(scale_label, 2, 2)
-
+        grid_layout.addWidget(scale_label, 1, 1)
         self.scale_factor_spin = QtWidgets.QDoubleSpinBox()
         self.scale_factor_spin.setRange(0, 1.0)
         self.scale_factor_spin.setValue(0.67)
@@ -609,29 +583,106 @@ class LiveUploaderGUI(QtWidgets.QMainWindow):
         self.scale_factor_spin.setDecimals(2)
         self.scale_factor_spin.setEnabled(False)
         self.scale_factor_spin.setFixedWidth(70)
-        grid_layout.addWidget(self.scale_factor_spin, 2, 3)
-
-        # Reduced stretching to keep things more compact
-        grid_layout.setColumnStretch(1, 0)
-        grid_layout.setColumnStretch(3, 0)
+        grid_layout.addWidget(self.scale_factor_spin, 1, 2)
 
         grid_widget.setLayout(grid_layout)
-        filter_layout.addWidget(grid_widget)
-        filter_settings.setLayout(filter_layout)
-        layout.addWidget(filter_settings)
+        layout.addWidget(grid_widget)
+
+        # Horizontal line
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+
+        # Values section
+        values_widget = QtWidgets.QWidget()
+        values_layout = QtWidgets.QVBoxLayout()
+        values_layout.setSpacing(2)  # Reduced overall vertical spacing
+
+        # Max Values Row (Raw and Avg Max)
+        max_values = QtWidgets.QHBoxLayout()
+        max_values.setSpacing(20)
+        max_values.setContentsMargins(0, 0, 0, 2)
+
+        # Raw Max Value
+        raw_max_layout = QtWidgets.QHBoxLayout()
+        raw_max_label = QtWidgets.QLabel("Raw Max:")
+        self.max_value_label = QtWidgets.QLineEdit()
+        self.max_value_label.setReadOnly(True)
+        self.max_value_label.setFixedWidth(100)
+        self.max_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        raw_max_layout.addWidget(raw_max_label)
+        raw_max_layout.addWidget(self.max_value_label)
+        max_values.addLayout(raw_max_layout)
+
+        # Average Max Value
+        avg_max_layout = QtWidgets.QHBoxLayout()
+        avg_max_label = QtWidgets.QLabel("Avg Max:")
+        self.avg_max_value_label = QtWidgets.QLineEdit()
+        self.avg_max_value_label.setReadOnly(True)
+        self.avg_max_value_label.setFixedWidth(100)
+        self.avg_max_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        avg_max_layout.addWidget(avg_max_label)
+        avg_max_layout.addWidget(self.avg_max_value_label)
+        max_values.addLayout(avg_max_layout)
+
+        values_layout.addLayout(max_values)
+
+        # Min Values Row (Raw and Avg Min)
+        min_values = QtWidgets.QHBoxLayout()
+        min_values.setSpacing(20)
+        min_values.setContentsMargins(0, 0, 0, 0)
+
+        # Raw Min Value
+        raw_min_layout = QtWidgets.QHBoxLayout()
+        raw_min_label = QtWidgets.QLabel("Raw Min:")
+        self.min_value_label = QtWidgets.QLineEdit()
+        self.min_value_label.setReadOnly(True)
+        self.min_value_label.setFixedWidth(100)
+        self.min_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        raw_min_layout.addWidget(raw_min_label)
+        raw_min_layout.addWidget(self.min_value_label)
+        min_values.addLayout(raw_min_layout)
+
+        # Average Min Value
+        avg_min_layout = QtWidgets.QHBoxLayout()
+        avg_min_label = QtWidgets.QLabel("Avg Min:")
+        self.avg_min_value_label = QtWidgets.QLineEdit()
+        self.avg_min_value_label.setReadOnly(True)
+        self.avg_min_value_label.setFixedWidth(100)
+        self.avg_min_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        avg_min_layout.addWidget(avg_min_label)
+        avg_min_layout.addWidget(self.avg_min_value_label)
+        min_values.addLayout(avg_min_layout)
+
+        values_layout.addLayout(min_values)
+
+        values_widget.setLayout(values_layout)
+        layout.addWidget(values_widget)
 
         group.setLayout(layout)
         return group
 
     def _update_min_max_display(self, data):
         if data is not None:
-            min_val = np.nanmin(data)
-            max_val = np.nanmax(data)
-            self.min_value_label.setText(f"{min_val:.4f}")
-            self.max_value_label.setText(f"{max_val:.4f}")
+            # Raw min/max values (across all data points)
+            raw_min = np.nanmin(data)
+            raw_max = np.nanmax(data)
+            self.min_value_label.setText(f"{raw_min:.4f}")
+            self.max_value_label.setText(f"{raw_max:.4f}")
+
+            # Average line min/max values (same calculation as used in plot)
+            average_line = np.nanmean(data, axis=0)
+            avg_min = np.nanmin(average_line)
+            avg_max = np.nanmax(average_line)
+            self.avg_min_value_label.setText(f"{avg_min:.4f}")
+            self.avg_max_value_label.setText(f"{avg_max:.4f}")
         else:
+            # Clear all displays when no data is present
             self.min_value_label.setText("")
             self.max_value_label.setText("")
+            self.avg_min_value_label.setText("")
+            self.avg_max_value_label.setText("")
 
     def _create_upload_settings(self):
         group = UIComponents.create_group_box("Upload Settings", Styles.GROUP_BOX)
